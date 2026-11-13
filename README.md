@@ -1,62 +1,73 @@
-# SailGP Data Analyst Challenge
+# SailGP Data Analyst Challenge — Auckland, 19 January 2025
 
-## Overview
+An answer to the eight questions of the [SailGP Data Analyst Challenge](https://github.com/DrSailGP/SGP_Data_Challenge).
+The original task description is in [CHALLENGE.md](CHALLENGE.md).
 
-This project is aimed at analyzing the data from the SailGP event in Auckland 2025. The data is provided in various formats and the goal is to answer specific questions using Python. The analysis includes data processing, visualization, and deriving insights from the provided datasets.
+Everything is in [main.ipynb](main.ipynb), which runs top to bottom in a few minutes. The reusable code sits in a
+small package, `sgp/`, with unit tests in `tests/`.
 
-## Data Sources
+## What the data says
 
-- **Boat Logs**: Located in the `Boat_Logs` folder. The data is in CSV format and the columns are described in the `Boat_Logs/Boat_Logs_Columns.csv` file.
-- **Course Marks**: The `Course_Marks_2025-01-19.csv` file contains the mark positions and wind readings on the course for the whole day.
-- **Race XML**: The `Race_XML` folder contains XML files for each race that include information on course boundaries, theoretical mark positions, and target racecourse axis.
-- **Manoeuvre Summary**: The `2025-01-19_man_summary.csv` file contains metrics from the manoeuvre summary for the day.
-- **Straight Line Summary**: The `2025-01-19_straight_lines.csv` file contains metrics from the straight line summary for the day.
-- **Polar Data**: The `2502 m8_APW_HSB2_HSRW.kph.csv` file contains the polar data for the boats in that configuration.
+| # | Question | Result |
+|---|---|---|
+| 1 | Mean of a compass direction | Vector mean per time bin, with a quality flag. The plain mean is wrong by more than 5° in 5 % of the ten-second heading bins of this data set, mostly on the beats, where port tack is sailed close to north. |
+| 2 | VMC from XML + lat/lon | Works from positions alone. The XML is not where the marks were: the start line is ~200 m off at the gun, the leeward gate 75–110 m, and the course marks of the race 8 file 550–790 m. Marks are therefore taken from their measured positions. Leg changes match the logged leg counter to 0–1 s at the start line and to a median of 1–5 s at gates and marks. |
+| 3 | Calibration | Upwind, the fleet reports a true wind direction 3.5° further left on port tack than on starboard: TWA reads ~1.8° too wide. A table per boat, point of sail and tack removes that flip on a held-out race. USA has a faulty bow wind sensor and a faulty starboard ride-height sensor. |
+| 4 | Distance to leader | Progress along the course centre line; the leader is the boat with the most progress. |
+| 5 | Minimum tacks / gybes | Dynamic programme in layline coordinates, inside the course boundary: beats need 1–2 tacks depending on the gate marks chosen, runs 1 gybe, reaches 0. |
+| 6 | Tacked variables | Signed channels mirrored on port tack; port / starboard pairs turned into windward / leeward. |
+| 7 | Tack model | Staying on the foils decides a tack: one that stays up loses nothing against target (median −7 m in 40 s), one that comes down 62 m. Entry speed and peak turn rate predict it on teams the model has not seen (R² 0.78, grouped by boat). |
+| 8 | Race insights | Australia won race 5 and the final from the front; Denmark won races 6 and 7. The first beat is the most expensive leg (37 % of all time lost to winners), and 70 % of the lost time is lower speed, not extra distance. |
 
-## Requirements
+Three things in the data that are worth knowing before using it:
 
-- Python 3.8 or higher
-- Jupyter Notebook
-- Suggested Libraries: `pandas`, `numpy`, `bokeh`, `beautifulsoup4`(to read xmls), `matplotlib`, `scipy`
+* **The course XML is written about six minutes after the start.** Start buoys and the leeward gate have moved by then, and
+  the race 8 file does not describe the course that was sailed. `sgp.course.as_raced_course` freezes every mark where it
+  was measured while the fleet went past it.
+* **The wind does not know which tack a boat is on.** Comparing port and starboard tack over a race is a check on the
+  wind numbers that needs no reference instrument. Here it shows a 3–4° flip upwind in every fleet race.
+* **One boat has two faulty sensors** (USA: bow wind, starboard ride height). Anything that averages port and starboard
+  ride height is wrong for that boat; the code uses the median of the three ride-height sensors.
 
-## Setup
+## How to run
 
-1. Clone the repository:
-    ```sh
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
+```sh
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt        # Windows: .venv\Scripts\pip
+.venv/bin/jupyter notebook main.ipynb            # run from the repository root
+.venv/bin/python -m pytest tests                 # 12 tests, about a minute
+```
 
-2. Install the required libraries:
-    ```sh
-    pip install pandas numpy bokeh matplotlib scipy etc....
-    ```
+The notebook writes one extra file, `figures/dtl_race5.html`: the distance-to-leader chart of race 5 as an interactive
+Bokeh plot.
 
-3. Open the Jupyter Notebook:
-    ```sh
-    jupyter notebook main.ipynb
-    ```
+## Structure
 
-## Questions to Answer
+| Path | What it holds |
+|---|---|
+| `main.ipynb` | The answers, with tables and figures |
+| `sgp/geo.py` | Circular statistics, local metric frame, small 2-D geometry helpers |
+| `sgp/course.py` | Course from XML, as-raced marks, leg detection, progress, VMC, distance to leader |
+| `sgp/wind.py` | Wind triangle, tack-flip check, fleet-referenced calibration table, tacked channels |
+| `sgp/polar.py` | Polar targets and the minimum number of tacks / gybes inside the boundary |
+| `sgp/race.py` | Leg times, gap to the winner per phase, split into "sailed further" and "sailed slower" |
+| `sgp/plots.py` | Plot style, team colours, course plot |
+| `sgp/data.py` | Loading the challenge files |
+| `tests/` | Unit tests on small synthetic cases |
+| `Data/`, `Boat_Logs_Columns_Description.txt` | The challenge data, unchanged |
 
-1. **Calculate an accurate mean value for a compass direction (e.g., TWD or Heading) across a downsampled frequency.**
-2. **Calculate a VMC column for a timeseries of boat Lat/Lon values using a course XML.**
-3. **Verify and comment on the boats' calibration and propose a post-calibrated set of wind numbers.**
-4. **Calculate a Distance to Leader metric for each boat using a timeseries of Lat/Lon positions and a course XML.**
-5. **Calculate the minimum number of tacks or gybes for each leg of the course and each gate mark on the leg using a course XML, wind speed, direction, and polar data.**
-6. **Calculate a “tacked” set of variables depending on the tack of the boat and visualize the results.**
-7. **Train a model to explain the key features of tacks when optimizing for VMG and visualize the conclusions.**
-8. **Provide insights on what made a team win or underperform in the race.**
+## Limits
 
-## AI Assistance
-You are welcome to use AI tools to assist you in your analysis, we all do now... 
-If you do, sharing your preferred tools and how they helped you would be appreciated.
+One afternoon, three fleet races and a three-boat final, in 32–44 km/h of wind. The calibration is relative to the fleet
+and cannot see an error all boats share on both tacks. The tack model is observational: it says which tacks were good,
+not what happens when a crew forces a faster turn. The manoeuvre summary has no column description; what its columns
+mean was read from the numbers and is stated where it is used.
 
-## Usage
-- The notebook `main.ipynb` contains the code and analysis for the questions listed above.
-- Each section of the notebook corresponds to a specific question and includes the necessary code, comments, and visualizations.
+## AI assistance
 
+The challenge asks which AI tools were used. Claude (Anthropic) was used throughout, for writing the code and for
+drafting the text. Every number and statement in the notebook was afterwards checked against the executed outputs.
 
-## Contact
+## Data
 
-For any questions or inquiries, please contact [drey@sailgp.com], [kkonig@sailgp.com].
+The data belongs to SailGP and comes from the challenge repository, which carries no licence.
