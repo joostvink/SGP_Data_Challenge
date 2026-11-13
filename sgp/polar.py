@@ -46,15 +46,8 @@ class Polar:
         }
 
 
-def _distance_to_polygon_edges(pts, poly):
-    best = np.full(len(pts), np.inf)
-    for a, b in zip(poly, np.roll(poly, -1, axis=0)):
-        best = np.minimum(best, np.linalg.norm(pts - geo.closest_point_on_segment(pts, a, b), axis=1))
-    return best
-
-
 def min_manoeuvres(start, target, twd, tws, polar: Polar, boundary=None, margin=0.0, n=120) -> dict:
-    """Fewest tacks (or gybes) needed to sail from ``start`` to ``target``.
+    """Fewest manoeuvres on a finite grid of the two best-VMG headings.
 
     Method
     ------
@@ -66,8 +59,9 @@ def min_manoeuvres(start, target, twd, tws, polar: Polar, boundary=None, margin=
        staircase is one manoeuvre.
     3. The staircase with the fewest corners that stays inside the course
        boundary (shrunk by ``margin`` metres) is found with a dynamic
-       programme over an ``n`` x ``n`` grid in those coordinates. This handles
-       boundaries of any shape, not just 'sail to the layline'.
+       programme over an ``n`` x ``n`` grid. Complete edges must remain inside
+       the boundary and meet the margin. This is a restricted grid optimum,
+       not a continuous minimum over all positive-speed polar headings.
 
     Positions are (east, north) metres. Returns a dict with ``mode``
     ("beat", "run" or "fetch"), ``manoeuvres`` (None when no route fits inside
@@ -75,10 +69,14 @@ def min_manoeuvres(start, target, twd, tws, polar: Polar, boundary=None, margin=
     """
     start = np.asarray(start, dtype=float)
     target = np.asarray(target, dtype=float)
+    if n < 2 or margin < 0 or not np.isfinite([*start, *target, twd, tws]).all():
+        raise ValueError("Finite inputs, n >= 2 and a nonnegative margin are required")
     tg = polar.targets(tws)
     direct_twa = abs(float(geo.wrap180(twd - geo.bearing_of(target - start))))
     if tg["up_twa"] <= direct_twa <= tg["down_twa"]:
-        return {"mode": "fetch", "manoeuvres": 0, "twa": direct_twa, "path": np.stack([start, target])}
+        feasible = boundary is None or bool(geo.segments_in_polygon(start, target, boundary, margin))
+        return {"mode": "fetch", "manoeuvres": 0 if feasible else None,
+                "twa": direct_twa, "path": np.stack([start, target]) if feasible else None}
 
     mode, angle = ("beat", tg["up_twa"]) if direct_twa < tg["up_twa"] else ("run", tg["down_twa"])
     # heading = TWD + |TWA| has the wind on the port side, TWD - |TWA| on starboard
@@ -89,13 +87,14 @@ def min_manoeuvres(start, target, twd, tws, polar: Polar, boundary=None, margin=
     b = np.linspace(0.0, b_max, n)
     pts = start + a[:, None, None] * e_port + b[None, :, None] * e_stbd
     ok = np.ones((n, n), dtype=bool)
+    edge_a = np.ones((n - 1, n), bool)
+    edge_b = np.ones((n, n - 1), bool)
     if boundary is not None:
-        flat = pts.reshape(-1, 2)
-        inside = geo.points_in_polygon(flat, boundary)
-        if margin > 0:
-            inside &= _distance_to_polygon_edges(flat, boundary) >= margin
-        ok = inside.reshape(n, n)
-        ok[0, 0] = ok[-1, -1] = True  # the marks themselves are always reachable
+        edge_a = geo.segments_in_polygon(pts[:-1], pts[1:], boundary, margin)
+        edge_b = geo.segments_in_polygon(pts[:, :-1], pts[:, 1:], boundary, margin)
+        ok = geo.segments_in_polygon(pts, pts, boundary, margin)
+    if not ok[0, 0] or not ok[-1, -1]:
+        return {"mode": mode, "manoeuvres": None, "twa": angle, "path": None}
 
     # turns[i, j, d]: fewest manoeuvres to reach node (i, j) arriving on board d (0 = port, 1 = starboard)
     # came[i, j, d]: the board sailed into the previous node, to walk the route back
@@ -108,10 +107,10 @@ def min_manoeuvres(start, target, twd, tws, polar: Polar, boundary=None, margin=
         for j in range(n):
             if not ok[i, j] or (i == 0 and j == 0):
                 continue
-            if i > 0:
+            if i > 0 and edge_a[i - 1, j]:
                 same, other = turns[i - 1, j, 0], turns[i - 1, j, 1] + 1
                 turns[i, j, 0], came[i, j, 0] = (same, 0) if same <= other else (other, 1)
-            if j > 0:
+            if j > 0 and edge_b[i, j - 1]:
                 same, other = turns[i, j - 1, 1], turns[i, j - 1, 0] + 1
                 turns[i, j, 1], came[i, j, 1] = (same, 1) if same <= other else (other, 0)
     best = int(turns[-1, -1].min())

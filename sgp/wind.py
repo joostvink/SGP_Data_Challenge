@@ -51,14 +51,23 @@ def leave_one_out_reference(df, twd="twd", tws="tws", time="DATETIME", boat="BOA
     Using the rest of the fleet as the reference avoids a boat being compared
     with itself. Rows with fewer than ``min_boats`` other boats get NaN.
     """
-    rad = np.radians(df[twd])
-    parts = pd.DataFrame({"s": np.sin(rad), "c": np.cos(rad), "v": df[tws], "n": 1.0})
-    tot = parts.groupby(df[time]).transform("sum")
-    others = tot - parts
-    ok = others["n"] >= min_boats
+    valid_dir = np.isfinite(df[twd])
+    valid_speed = np.isfinite(df[tws]) & (df[tws] > 0)
+    angle = np.radians(df[twd].where(valid_dir))
+    samples = pd.DataFrame({"boat": df[boat], "time": df[time],
+                            "s": np.sin(angle), "c": np.cos(angle),
+                            "v": df[tws].where(valid_speed)})
+    per_boat = samples.groupby(["time", "boat"])[["s", "c", "v"]].mean()
+    per_boat["n_dir"] = per_boat["s"].notna().astype(int)
+    per_boat["n_speed"] = per_boat["v"].notna().astype(int)
+    others = per_boat.groupby(level="time").transform("sum") - per_boat.fillna(0)
+    keys = pd.MultiIndex.from_arrays([df[time], df[boat]])
+    other = others.reindex(keys)
+    direction_ok = (other["n_dir"] >= min_boats) & (np.hypot(other["s"], other["c"]) > 1e-12)
+    speed_ok = other["n_speed"] >= min_boats
     ref = pd.DataFrame(index=df.index)
-    ref["twd_ref"] = np.where(ok, geo.wrap360(np.degrees(np.arctan2(others["s"], others["c"]))), np.nan)
-    ref["tws_ref"] = np.where(ok, others["v"] / others["n"].where(ok), np.nan)
+    ref["twd_ref"] = np.where(direction_ok, geo.wrap360(np.degrees(np.arctan2(other["s"], other["c"]))), np.nan)
+    ref["tws_ref"] = np.where(speed_ok, other["v"] / other["n_speed"].where(speed_ok), np.nan)
     return ref
 
 
@@ -73,8 +82,9 @@ def instantaneous_twd(df):
 def tack_flip(df, twd, tws="TWS_SGP_km_h_1", by=("race",)) -> pd.DataFrame:
     """Fleet-wide difference between the wind seen on port and on starboard tack.
 
-    The real wind does not know which tack a boat is on, so over a race the
-    two tacks must report the same direction and speed. ``flip_deg`` is the
+    Tack differences can reflect calibration, but also different positions,
+    times and environmental conditions. This diagnostic alone cannot identify
+    an absolute sensor error. ``flip_deg`` is the
     mean TWD on port minus the mean TWD on starboard; ``tws_ratio`` is the
     mean TWS on port divided by the mean on starboard.
     """
@@ -186,19 +196,41 @@ PAIRED_CHANNELS = {
 def add_tacked(df, twa="TWA_SGP_deg", hold_s=3) -> pd.DataFrame:
     """Add tack-normalised copies of the tack-dependent channels.
 
-    * ``tack``: "port" / "stbd" from the sign of the TWA, held through
-      ``hold_s`` samples so it does not flicker while the bow passes through
-      the wind.
+    * ``tack``: "port" / "stbd" from a trailing ``hold_s``-second vote when timestamps
+      are present (otherwise a sample vote). It resets across race/data gaps
+      and never uses future observations.
     * ``<channel>_tk`` for every signed channel: the starboard-tack value on
       both tacks (port-tack samples are mirrored).
     * ``..._WW_...`` / ``..._LW_...`` for every port/starboard pair: the
       windward and the leeward side.
     """
     out = df.copy()
-    sign = np.sign(out[twa]).replace(0, np.nan)
-    if hold_s and hold_s > 1:  # majority vote over a short window, per boat
-        sign = sign.groupby(out["BOAT"]).transform(lambda s: np.sign(s.rolling(hold_s, center=True, min_periods=1).sum()))
-    sign = sign.replace(0, np.nan).groupby(out["BOAT"]).ffill().fillna(1.0)
+    order = out[["BOAT"]].copy()
+    order["_row"] = np.arange(len(out))
+    if "race" in out:
+        order["race"] = out["race"]
+    if "DATETIME" in out:
+        order["DATETIME"] = out["DATETIME"]
+    group_cols = ["BOAT"] + (["race"] if "race" in out else [])
+    order = order.sort_values(group_cols + (["DATETIME"] if "DATETIME" in out else ["_row"]))
+    position = order["_row"].to_numpy()
+    sign = pd.Series(np.sign(out[twa].to_numpy()[position]), index=order.index).replace(0, np.nan)
+    group = order.groupby(group_cols, sort=False).ngroup()
+    if "DATETIME" in out:
+        delta = order.groupby(group_cols)["DATETIME"].diff().dt.total_seconds()
+        reset = delta.isna() | (delta <= 0) | (delta > max(float(hold_s), 5.0))
+        group = reset.cumsum()
+    if hold_s and hold_s > 1:
+        if "DATETIME" in out:
+            sign = sign.groupby(group).transform(lambda z: pd.Series(
+                z.to_numpy(), index=pd.DatetimeIndex(order.loc[z.index, "DATETIME"])
+            ).rolling(pd.Timedelta(seconds=hold_s), min_periods=1).sum().pipe(np.sign).to_numpy())
+        else:
+            sign = sign.groupby(group).transform(lambda z: np.sign(z.rolling(int(hold_s), min_periods=1).sum()))
+    sign = sign.replace(0, np.nan).groupby(group).ffill().fillna(1.0)
+    restored = np.empty(len(out))
+    restored[position] = sign.to_numpy()
+    sign = pd.Series(restored, index=out.index)
     out["tack"] = np.where(sign < 0, "port", "stbd")
     port = (sign < 0).to_numpy()
     for c in SIGNED_CHANNELS:

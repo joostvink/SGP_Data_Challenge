@@ -14,47 +14,89 @@ def race_tracks(logs: pd.DataFrame, course: Course) -> pd.DataFrame:
     """Boat logs of one race with leg, progress and VMC added for every boat."""
     parts = [add_course_metrics(g, course) for _, g in logs[logs["race"] == int(course.race_id)].groupby("BOAT")]
     out = pd.concat(parts, ignore_index=True)
-    # median of the three sensors: one of them can fail (USA's starboard sensor reads about -800 mm all day)
-    out["ride_height_mm"] = out[["LENGTH_RH_P_mm", "LENGTH_RH_S_mm", "LENGTH_RH_BOW_mm"]].median(axis=1)
+    # Exclude the known invalid channel before aggregating available sensors.
+    height = out[["LENGTH_RH_P_mm", "LENGTH_RH_S_mm", "LENGTH_RH_BOW_mm"]].copy()
+    height.loc[out["BOAT"] == "USA", "LENGTH_RH_S_mm"] = np.nan
+    out["ride_height_mm"] = height.median(axis=1)
     out["foiling"] = out["ride_height_mm"] > FOILING_RH_MM
     return out
 
 
-def leg_times(tracks: pd.DataFrame, course: Course, finish_tolerance_m=60.0) -> pd.DataFrame:
-    """Time each boat entered each leg, seconds after the start signal.
+def _passages(g, course, finish_tolerance_m=60.0):
+    xy = g[["x_m", "y_m"]].to_numpy() if "x_m" in g else course.frame.to_xy(g["LATITUDE_GPS_unk"], g["LONGITUDE_GPS_unk"])
+    events = course.passage_times(g["DATETIME"], xy)
+    finish, status = course.finish_time(g["DATETIME"], xy, tolerance_m=finish_tolerance_m, events=events)
+    if pd.notna(finish):
+        events[course.n_legs] = finish
+    return events, status, xy
 
-    Columns 1..n are the leg entry times (1 = crossed the start line) and
-    ``n + 1`` is the finish. The logs of most boats stop at the finish line,
-    so a boat whose last sample is within ``finish_tolerance_m`` of the full
-    course length is counted as finished at that sample.
+
+def leg_times(tracks: pd.DataFrame, course: Course, finish_tolerance_m=60.0) -> pd.DataFrame:
+    """Interpolated leg-entry times in seconds after the gun.
+
+    The final column may include a short extrapolation of an approaching,
+    truncated log. The finish_status attribute identifies those estimates;
+    missing finishes are not treated as official retirements.
     """
-    total = sum(course.leg_length(k) for k in range(1, course.n_legs + 1))
-    rows = {}
+    rows, statuses = {}, {}
     for boat, g in tracks.groupby("BOAT"):
-        t = (g["DATETIME"] - course.start_time).dt.total_seconds().to_numpy()
-        leg = g["leg"].to_numpy()
-        row = {k: (t[np.argmax(leg >= k)] if (leg >= k).any() else np.nan) for k in range(1, course.n_legs + 2)}
-        if np.isnan(row[course.n_legs + 1]) and leg.max() == course.n_legs and g["progress_m"].iloc[-1] >= total - finish_tolerance_m:
-            row[course.n_legs + 1] = t[-1]
-        rows[boat] = row
+        g = g.sort_values("DATETIME")
+        events, statuses[boat], _ = _passages(g, course, finish_tolerance_m)
+        rows[boat] = {k + 1: (events[k] - course.start_time).total_seconds() if k in events else np.nan
+                      for k in range(course.n_legs + 1)}
     out = pd.DataFrame(rows).T
     out.index.name = "BOAT"
+    out.attrs["finish_status"] = statuses
     return out
 
 
-def leg_summary(tracks: pd.DataFrame, course: Course) -> pd.DataFrame:
-    """Per boat and leg: elapsed time, distance sailed, average speed, VMC, time off the foils."""
-    racing = tracks[(tracks["leg"] >= 1) & (tracks["leg"] <= course.n_legs)].copy()
-    step = np.hypot(racing.groupby("BOAT")["x_m"].diff(), racing.groupby("BOAT")["y_m"].diff())
-    dt = racing.groupby("BOAT")["DATETIME"].diff().dt.total_seconds()
-    same_leg = racing.groupby("BOAT")["leg"].diff() == 0
-    racing["step_m"] = step.where(same_leg & (dt <= 5))
-    racing["dt_s"] = dt.where(same_leg & (dt <= 5))
-    racing["off_foil_s"] = racing["dt_s"].where(~racing["foiling"])
-    g = racing.groupby(["BOAT", "leg"])
-    out = g.agg(time_s=("dt_s", "sum"), sailed_m=("step_m", "sum"), off_foil_s=("off_foil_s", "sum"), vmc_kmh=("vmc_kmh", "mean"), tws_kmh=("TWS_SGP_km_h_1", "mean"))
-    out["speed_kmh"] = out["sailed_m"] / out["time_s"] * 3.6
-    return out
+def _position_at(seconds, xy, query):
+    """Linear interpolation; short finish extrapolation uses recent velocity."""
+    values = np.column_stack([np.interp(query, seconds, xy[:, j]) for j in [0, 1]])
+    later = query > seconds[-1]
+    if later.any():
+        recent = seconds >= seconds[-1] - 5
+        velocity = np.array([np.polyfit(seconds[recent] - seconds[-1], xy[recent, j], 1)[0] for j in [0, 1]])
+        values[later] = xy[-1] + (query[later] - seconds[-1])[:, None] * velocity
+    return values
+
+
+def leg_summary(tracks: pd.DataFrame, course: Course, max_gap_s=5.0) -> pd.DataFrame:
+    """Integrate complete leg intervals using the same crossings as leg_times.
+
+    Transition segments are split at the interpolated passage. A long gap
+    preserves elapsed time but leaves distance/speed/foil duration undefined.
+    Off-foil time uses the most recent observed sensor state per interval.
+    """
+    rows = []
+    for boat, g in tracks.groupby("BOAT"):
+        g = g.sort_values("DATETIME")
+        events, status, xy = _passages(g, course)
+        seconds = (g["DATETIME"] - course.start_time).dt.total_seconds().to_numpy()
+        for k in range(1, course.n_legs + 1):
+            if k - 1 not in events or k not in events:
+                continue
+            a = (events[k - 1] - course.start_time).total_seconds()
+            b = (events[k] - course.start_time).total_seconds()
+            if b <= a:
+                continue
+            query = np.r_[a, seconds[(seconds > a) & (seconds < b)], b]
+            positions = _position_at(seconds, xy, query)
+            duration = np.diff(query)
+            observed_dt = np.diff(seconds)
+            overlaps = (seconds[:-1] < b) & (seconds[1:] > a)
+            covered = not (observed_dt[overlaps] > max_gap_s).any() and np.isfinite(positions).all()
+            previous = np.clip(np.searchsorted(seconds, query[:-1], side="right") - 1, 0, len(g) - 1)
+            sailed = np.linalg.norm(np.diff(positions, axis=0), axis=1).sum() if covered else np.nan
+            off = duration[~g["foiling"].to_numpy(bool)[previous]].sum() if covered else np.nan
+            within = g[(seconds >= a) & (seconds <= min(b, seconds[-1]))]
+            rows.append({"BOAT": boat, "leg": k, "time_s": b - a, "sailed_m": sailed,
+                         "speed_kmh": sailed / (b - a) * 3.6, "off_foil_s": off,
+                         "vmc_kmh": within["vmc_kmh"].mean(), "tws_kmh": within["TWS_SGP_km_h_1"].mean(),
+                         "coverage_complete": covered, "finish_status": status})
+    if not rows:
+        return pd.DataFrame(columns=["BOAT", "leg", "time_s", "sailed_m", "speed_kmh", "off_foil_s", "vmc_kmh", "tws_kmh", "coverage_complete", "finish_status"]).set_index(["BOAT", "leg"])
+    return pd.DataFrame(rows).set_index(["BOAT", "leg"])
 
 
 def gap_to_winner(times: pd.DataFrame) -> pd.DataFrame:
@@ -66,6 +108,8 @@ def gap_to_winner(times: pd.DataFrame) -> pd.DataFrame:
     """
     n = times.shape[1] - 1
     finished = times.dropna(subset=[n + 1])
+    if finished.empty:
+        raise ValueError("No complete inferred finish times are available")
     winner = finished[n + 1].idxmin()
     out = pd.DataFrame({"start": finished[1] - finished.loc[winner, 1]})
     for k in range(1, n + 1):
@@ -75,23 +119,31 @@ def gap_to_winner(times: pd.DataFrame) -> pd.DataFrame:
 
 
 def distance_speed_split(summary: pd.DataFrame, reference: str) -> pd.DataFrame:
-    """Split each boat's time difference to ``reference`` on a leg into 'sailed further' and 'sailed slower'.
+    """Logarithmic-mean allocation of leg-time differences to distance/speed.
 
-    time = distance / speed, so log(time ratio) = log(distance ratio) - log(speed ratio).
-    The time difference is shared out in proportion to those two log terms,
-    which makes the two parts add up exactly to the difference.
+    This is an accounting convention, not a causal attribution. Components
+    can be negative. Their sum equals the elapsed-time difference, including
+    the continuous equal-time case with offsetting component effects.
     """
     ref = summary.xs(reference, level="BOAT")
     rows = []
     for (boat, leg), r in summary.iterrows():
-        if leg not in ref.index or r["time_s"] <= 0:
+        if leg not in ref.index:
             continue
         b = ref.loc[leg]
+        required = np.array([r["time_s"], b["time_s"], r["sailed_m"], b["sailed_m"]])
+        if not np.isfinite(required).all() or (required <= 0).any():
+            raise ValueError(f"Positive, complete time and distance required for {boat}, leg {leg}")
         dt = r["time_s"] - b["time_s"]
-        ld, lv = np.log(r["sailed_m"] / b["sailed_m"]), -np.log(r["speed_kmh"] / b["speed_kmh"])
-        share = ld / (ld + lv) if abs(ld + lv) > 1e-9 else 0.5
-        rows.append({"BOAT": boat, "leg": leg, "dt_s": dt, "further_s": dt * share, "slower_s": dt * (1 - share), "extra_m": r["sailed_m"] - b["sailed_m"], "speed_diff_kmh": r["speed_kmh"] - b["speed_kmh"]})
-    return pd.DataFrame(rows).set_index(["BOAT", "leg"])
+        log_time = np.log1p(dt / b["time_s"])
+        mean_time = dt / log_time if abs(log_time) > 1e-10 else (r["time_s"] + b["time_s"]) / 2
+        further = mean_time * np.log(r["sailed_m"] / b["sailed_m"])
+        speed = r["sailed_m"] / r["time_s"] * 3.6
+        base_speed = b["sailed_m"] / b["time_s"] * 3.6
+        rows.append({"BOAT": boat, "leg": leg, "dt_s": dt, "further_s": further,
+                     "slower_s": dt - further, "extra_m": r["sailed_m"] - b["sailed_m"],
+                     "speed_diff_kmh": speed - base_speed})
+    return pd.DataFrame(rows, columns=["BOAT", "leg", "dt_s", "further_s", "slower_s", "extra_m", "speed_diff_kmh"]).set_index(["BOAT", "leg"])
 
 
 def start_table(tracks: pd.DataFrame, course: Course) -> pd.DataFrame:
@@ -102,12 +154,17 @@ def start_table(tracks: pd.DataFrame, course: Course) -> pd.DataFrame:
         if not (g["leg"] >= 1).any():
             continue
         gun = g.loc[t.abs().idxmin()]
-        cross = g.loc[(g["leg"] >= 1).idxmax()]
+        g = g.sort_values("DATETIME")
+        events, _, _ = _passages(g, course)
+        if 0 not in events:
+            continue
+        crossing = (events[0] - course.start_time).total_seconds()
+        seconds = (g["DATETIME"] - course.start_time).dt.total_seconds().to_numpy()
         rows[boat] = {
             "at_gun_behind_line_m": -gun["progress_m"] if gun["leg"] == 0 else 0.0,
             "at_gun_speed_kmh": gun["BOAT_SPEED_km_h_1"],
-            "cross_s": (cross["DATETIME"] - course.start_time).total_seconds(),
-            "cross_speed_kmh": cross["BOAT_SPEED_km_h_1"],
+            "cross_s": crossing,
+            "cross_speed_kmh": np.interp(crossing, seconds, g["BOAT_SPEED_km_h_1"]),
         }
     out = pd.DataFrame(rows).T
     out.index.name = "BOAT"

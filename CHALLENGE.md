@@ -48,15 +48,6 @@ This project is aimed at analyzing the data from the SailGP event in Auckland 20
 7. **Train a model to explain the key features of tacks when optimizing for VMG and visualize the conclusions.**
 8. **Provide insights on what made a team win or underperform in the race.**
 
-## AI Assistance
-You are welcome to use AI tools to assist you in your analysis, we all do now... 
-If you do, sharing your preferred tools and how they helped you would be appreciated.
-
 ## Usage
 - The notebook `main.ipynb` contains the code and analysis for the questions listed above.
 - Each section of the notebook corresponds to a specific question and includes the necessary code, comments, and visualizations.
-
-
-## Contact
-
-For any questions or inquiries, please contact [drey@sailgp.com], [kkonig@sailgp.com].

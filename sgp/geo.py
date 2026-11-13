@@ -37,6 +37,8 @@ def circular_mean(deg, weights=None):
     """
     deg = np.asarray(deg, dtype=float)
     w = np.ones_like(deg) if weights is None else np.asarray(weights, dtype=float)
+    if np.any(w < 0):
+        raise ValueError("Direction weights must be nonnegative")
     ok = np.isfinite(deg) & np.isfinite(w)
     if not ok.any() or w[ok].sum() == 0:
         return np.nan, np.nan
@@ -44,7 +46,8 @@ def circular_mean(deg, weights=None):
     s = np.sum(w[ok] * np.sin(rad))
     c = np.sum(w[ok] * np.cos(rad))
     r = np.hypot(s, c) / np.sum(np.abs(w[ok]))
-    return float(wrap360(np.degrees(np.arctan2(s, c)))), float(r)
+    mean = float(wrap360(np.degrees(np.arctan2(s, c)))) if r > 1e-12 else np.nan
+    return mean, float(r)
 
 
 def resample_direction(series, rule="10s", weights=None, min_count=1, min_r=0.0):
@@ -68,7 +71,9 @@ def resample_direction(series, rule="10s", weights=None, min_count=1, min_r=0.0)
     """
     s = pd.Series(series, dtype=float)
     w = pd.Series(1.0, index=s.index) if weights is None else pd.Series(weights, dtype=float).reindex(s.index)
-    ok = s.notna() & w.notna()
+    if (w < 0).any():
+        raise ValueError("Direction weights must be nonnegative")
+    ok = np.isfinite(s) & np.isfinite(w) & (w > 0)
     rad = np.radians(s.where(ok))
     parts = pd.DataFrame(
         {"sin": w * np.sin(rad), "cos": w * np.cos(rad), "w": w.abs().where(ok), "n": ok.astype(float)}
@@ -82,7 +87,7 @@ def resample_direction(series, rule="10s", weights=None, min_count=1, min_r=0.0)
             "n": parts["n"].fillna(0).astype(int),
         }
     )
-    bad = (out["n"] < min_count) | ~(out["r"] >= min_r)
+    bad = (out["n"] < min_count) | ~(out["r"] >= min_r) | (out["r"] <= 1e-12)
     out.loc[bad, ["mean", "std"]] = np.nan
     return out
 
@@ -138,7 +143,10 @@ def closest_point_on_segment(p, a, b):
     """Closest point to ``p`` (N,2) on the segment a-b."""
     p = np.asarray(p, dtype=float)
     ab = b - a
-    t = np.clip(((p - a) @ ab) / float(ab @ ab), 0.0, 1.0)
+    den = float(ab @ ab)
+    if den == 0:
+        return np.broadcast_to(a, p.shape).copy()
+    t = np.clip(((p - a) @ ab) / den, 0.0, 1.0)
     return a + t[..., None] * ab
 
 
@@ -156,7 +164,7 @@ def segment_hits(p0, p1, a, b):
     with np.errstate(divide="ignore", invalid="ignore"):
         t = cross2(a - p0, e) / den
         s = cross2(a - p0, d) / den
-    hit = np.isfinite(t) & (t >= 0) & (t < 1) & (s >= 0) & (s <= 1)
+    hit = np.isfinite(t) & (t >= 0) & (t <= 1) & (s >= 0) & (s <= 1)
     return hit, np.where(hit, t, np.nan), np.where(hit, s, np.nan)
 
 
@@ -171,3 +179,53 @@ def points_in_polygon(pts, poly):
             x_cross = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
         inside ^= straddles & (x < x_cross)
     return inside
+
+
+def segments_in_polygon(p0, p1, poly, margin=0.0):
+    """Check complete closed segments, including concavities and edge clearance.
+
+    Polygon intersections partition each segment into intervals. Testing each
+    interval midpoint handles narrow notches even when no sampled grid node
+    lies inside the notch. Touching the boundary is allowed at zero margin.
+    """
+    if margin < 0:
+        raise ValueError("Boundary margin must be nonnegative")
+    p0, p1 = np.broadcast_arrays(np.asarray(p0, float), np.asarray(p1, float))
+    shape = p0.shape[:-1]
+    a, b = p0.reshape(-1, 2), p1.reshape(-1, 2)
+    poly = np.asarray(poly, float)
+    d = b - a
+    dd = np.sum(d * d, axis=1)
+    cuts = [np.zeros(len(a)), np.ones(len(a))]
+    clearance = np.full(len(a), np.inf)
+    for u, v in zip(poly, np.roll(poly, -1, axis=0)):
+        edge = v - u
+        den = cross2(d, edge)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = cross2(u - a, edge) / den
+            s = cross2(u - a, d) / den
+        hit = np.isfinite(t) & (t >= 0) & (t <= 1) & (s >= 0) & (s <= 1)
+        cuts.append(np.where(hit, t, 1.0))
+        distance = np.minimum(
+            np.linalg.norm(a - closest_point_on_segment(a, u, v), axis=1),
+            np.linalg.norm(b - closest_point_on_segment(b, u, v), axis=1),
+        )
+        for q in (u, v):
+            fraction = np.divide(np.sum((q - a) * d, axis=1), dd,
+                                 out=np.zeros(len(a)), where=dd > 0)
+            closest = a + np.clip(fraction, 0, 1)[:, None] * d
+            distance = np.minimum(distance, np.linalg.norm(q - closest, axis=1))
+        clearance = np.minimum(clearance, np.where(hit, 0, distance))
+    fractions = np.sort(np.stack(cuts, axis=1), axis=1)
+    middle = (fractions[:, :-1] + fractions[:, 1:]) / 2
+    probes = a[:, None, :] + middle[..., None] * d[:, None, :]
+    inside = points_in_polygon(probes, poly)
+    # A midpoint on an edge is valid when no positive clearance is requested.
+    if margin == 0:
+        on_edge = np.zeros(inside.shape, bool)
+        for u, v in zip(poly, np.roll(poly, -1, axis=0)):
+            on_edge |= np.linalg.norm(probes - closest_point_on_segment(probes, u, v), axis=-1) <= 1e-8
+        inside |= on_edge
+    good = inside.all(axis=1) & (clearance >= margin - 1e-8)
+    good &= np.isfinite(a).all(axis=1) & np.isfinite(b).all(axis=1)
+    return good.reshape(shape)

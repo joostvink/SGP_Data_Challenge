@@ -145,49 +145,98 @@ class Course:
         return pd.DataFrame(rows).set_index("leg")
 
     # ---- track geometry --------------------------------------------------
-    def detect_legs(self, t, xy, gate_margin=60.0) -> np.ndarray:
-        """Leg number per sample, from positions and course geometry only.
+    def passage_times(self, t, xy, gate_margin=15.0, max_gap_s=5.0):
+        """Interpolated geometric passage times, keyed by waypoint sequence.
 
-        The track is walked waypoint by waypoint. A gate or line counts as
-        passed at the first step that crosses it in the direction of the leg
-        (the line is extended by ``gate_margin`` metres at both ends to absorb
-        mark drift and GPS antenna offset). A single mark counts as rounded at
-        the first step that crosses its rounding ray: the half-line that
-        starts at the mark and points away from the inside of the turn. The
-        start only counts from the start time onwards.
+        Start and finish use their finite segments; intermediate gates may
+        have an explicit antenna/mark-position tolerance. A directed rounding
+        ray respects Port/Stbd instructions but is not a racing-rules umpire.
+        No crossing is inferred through a long telemetry gap.
         """
         t_ns = pd.DatetimeIndex(t).to_numpy("datetime64[ns]").astype("int64")
         xy = np.asarray(xy, dtype=float)
-        leg = np.zeros(len(xy), dtype=int)
+        if len(t_ns) != len(xy) or xy.shape != (len(t_ns), 2):
+            raise ValueError("Time and position arrays must have matching lengths")
+        if len(xy) < 2:
+            return {}
+        dt = np.diff(t_ns)
+        if (dt <= 0).any():
+            raise ValueError("Track timestamps must be strictly increasing")
         p0, p1 = xy[:-1], xy[1:]
         step = p1 - p0
+        valid = np.isfinite(p0).all(axis=1) & np.isfinite(p1).all(axis=1)
+        valid &= dt <= max_gap_s * 1e9
         wps = [self._wp_xy(k, t_ns[:-1]) for k in range(len(self.waypoints))]
         centres = [w.mean(axis=1) for w in wps]
         axes = [None] + [geo.unit(centres[k] - centres[k - 1]) for k in range(1, len(wps))]
-        i_from = max(int(np.searchsorted(t_ns, self.start_time.value)) - 1, 0)
+        events = {}
+        earliest = self.start_time.value
         for k, wp in enumerate(self.waypoints):
             if wp.is_gate:
                 a, b = wps[k][:, 0], wps[k][:, 1]
                 e = geo.unit(b - a)
-                hit, _, _ = geo.segment_hits(p0, p1, a - gate_margin * e, b + gate_margin * e)
+                margin = gate_margin if 0 < k < self.n_legs else 0.0
+                hit, fraction, _ = geo.segment_hits(p0, p1, a - margin * e, b + margin * e)
                 hit &= np.einsum("ij,ij->i", step, axes[max(k, 1)]) > 0
             elif k < self.n_legs:
                 mark = wps[k][:, 0]
                 outward = geo.unit(axes[k] - axes[k + 1])
-                hit, _, _ = geo.segment_hits(p0, p1, mark, mark + 800.0 * outward)
-            else:  # course ending on a single mark: abeam of it along the last leg
+                hit, fraction, _ = geo.segment_hits(p0, p1, mark, mark + 800.0 * outward)
+                turn = geo.cross2(axes[k], step)
+                if wp.rounding == "Port":
+                    hit &= turn > 0
+                elif wp.rounding == "Stbd":
+                    hit &= turn < 0
+            else:
                 rem0 = np.einsum("ij,ij->i", wps[k][:, 0] - p0, axes[k])
                 rem1 = np.einsum("ij,ij->i", wps[k][:, 0] - p1, axes[k])
                 hit = (rem0 > 0) & (rem1 <= 0)
-            idx = np.flatnonzero(hit[i_from:])
-            if len(idx) == 0:
+                fraction = np.divide(rem0, rem0 - rem1, out=np.zeros(len(rem0)), where=rem0 != rem1)
+            crossing_ns = t_ns[:-1] + np.nan_to_num(fraction) * dt
+            hit &= valid & (crossing_ns >= earliest)
+            candidates = np.flatnonzero(hit)
+            if not len(candidates):
                 break
-            i_cross = i_from + idx[0] + 1  # first sample on the far side
-            leg[i_cross:] = k + 1
-            i_from = i_cross - 1
+            when = int(round(crossing_ns[candidates[0]]))
+            events[k] = pd.Timestamp(when)
+            earliest = when + 1
+        return events
+
+    def detect_legs(self, t, xy, gate_margin=15.0):
+        """Geometric leg label per sample; see passage_times for tolerances."""
+        times = pd.DatetimeIndex(t)
+        leg = np.zeros(len(times), dtype=int)
+        for k, when in self.passage_times(t, xy, gate_margin).items():
+            leg[times >= when] = k + 1
         return leg
 
-    def _remaining(self, k: int, xy) -> np.ndarray:
+    def finish_time(self, t, xy, tolerance_m=60.0, max_extrapolate_s=5.0, events=None):
+        """Return (timestamp, status): observed, estimated, or incomplete.
+
+        A short terminal log is extrapolated only while approaching the finish,
+        using the closing rate over at most the last five seconds. The estimate
+        is a timing convention, not an official result or an antenna correction.
+        """
+        times = pd.DatetimeIndex(t)
+        xy = np.asarray(xy, float)
+        events = self.passage_times(times, xy) if events is None else events
+        if self.n_legs in events:
+            return events[self.n_legs], "observed"
+        if len(times) < 2 or self.n_legs - 1 not in events:
+            return pd.NaT, "incomplete"
+        seconds = (times - times[-1]).total_seconds().to_numpy()
+        recent = (seconds >= -5) & np.isfinite(xy).all(axis=1)
+        if recent.sum() < 2 or not recent[-1]:
+            return pd.NaT, "incomplete"
+        remaining = self._remaining(self.n_legs, xy[recent])
+        closing = -np.polyfit(seconds[recent], remaining, 1)[0]
+        short = remaining[-1]
+        ahead = short / closing if closing > 0 else np.inf
+        if 0 < short <= tolerance_m and 0 <= ahead <= max_extrapolate_s:
+            return times[-1] + pd.Timedelta(seconds=float(ahead)), "estimated"
+        return pd.NaT, "incomplete"
+
+    def _remaining(self, k: int, xy, axis=None) -> np.ndarray:
         """Distance still to sail on leg ``k``, measured along the leg axis.
 
         For a gate or line this is the distance along the axis to the line
@@ -195,7 +244,7 @@ class Course:
         For a single mark it is zero when the mark is abeam.
         """
         wp = self.waypoints[k]
-        axis = self.leg_axis(max(k, 1))
+        axis = self.leg_axis(max(k, 1)) if axis is None else axis
         if wp.is_gate:
             e = geo.unit(wp.xy[1] - wp.xy[0])
             normal = np.array([-e[1], e[0]])
@@ -207,8 +256,9 @@ class Course:
     def progress(self, xy, leg) -> np.ndarray:
         """Metres sailed along the course centre line (the 'ladder' position).
 
-        Completed legs count with their full length; the current leg counts
-        with its length minus what remains along the leg axis. Before the
+        Completed legs count with their full length. On the current leg, signed
+        distances to its start and end lines define a normalised fraction.
+        This is continuous at either gate, including skew gates. Before the
         start the value is the (negative) distance behind the start line, and
         it stays at the full course length after the finish.
         """
@@ -222,7 +272,12 @@ class Course:
         for k in range(1, self.n_legs + 1):
             m = leg == k
             if m.any():
-                out[m] = done[k - 1] + np.clip(lengths[k - 1] - self._remaining(k, xy[m]), 0.0, lengths[k - 1])
+                axis = self.leg_axis(k)
+                sailed = -self._remaining(k - 1, xy[m], axis)
+                remaining = self._remaining(k, xy[m], axis)
+                span = sailed + remaining
+                fraction = np.divide(sailed, span, out=np.full_like(sailed, np.nan), where=np.abs(span) > 1e-9)
+                out[m] = done[k - 1] + lengths[k - 1] * np.clip(fraction, 0, 1)
         out[leg > self.n_legs] = done[-1]
         return out
 
@@ -284,30 +339,50 @@ def add_course_metrics(track: pd.DataFrame, course: Course, lat="LATITUDE_GPS_un
 
 
 def distance_to_leader(tracks: dict, course: Course, freq="1s", max_gap_s=5, **kwargs):
-    """Distance to leader for every boat on a common time base.
+    """Course-ladder gap on one fleet-wide grid, retaining completed boats.
 
-    ``tracks`` maps boat name to a DataFrame with time and position columns.
-    Each boat's course progress is put on a regular grid (short gaps are
-    interpolated, longer ones stay empty), the leader at each instant is the
-    boat with the most progress, and the distance to leader is the
-    difference in progress. Boats that have not started yet are left out.
-
-    Returns (dtl, progress, leg) as DataFrames indexed by time, one column per boat.
+    Only intervals between observations at most max_gap_s apart are filled.
+    Missing unfinished boats remain missing. Short near-line terminal tracks
+    use Course.finish_time's explicitly estimated finish before being retained.
     """
     time = kwargs.get("time", "DATETIME")
+    measured = {b: add_course_metrics(g, course, **kwargs).set_index(time) for b, g in tracks.items() if len(g)}
+    if not measured:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    finishes = {b: course.finish_time(m.index, m[["x_m", "y_m"]].to_numpy()) for b, m in measured.items()}
+    end = max([m.index.max() for m in measured.values()] + [t for t, _ in finishes.values() if pd.notna(t)])
+    grid = pd.date_range(min(m.index.min() for m in measured.values()).ceil(freq), end.ceil(freq), freq=freq)
     prog, legs = {}, {}
-    for boat, track in tracks.items():
-        m = add_course_metrics(track, course, **kwargs).set_index(time)
-        m = m[~m.index.duplicated()]
-        grid = pd.date_range(m.index.min().ceil(freq), m.index.max().floor(freq), freq=freq)
-        both = m[["progress_m", "leg"]].reindex(m.index.union(grid))
-        limit = int(max_gap_s / pd.Timedelta(freq).total_seconds())
-        prog[boat] = both["progress_m"].interpolate("time", limit=limit, limit_area="inside").reindex(grid)
-        legs[boat] = both["leg"].ffill(limit=limit).reindex(grid)
-    progress = pd.DataFrame(prog)
-    leg = pd.DataFrame(legs)
+    total = sum(course.leg_length(k) for k in range(1, course.n_legs + 1))
+    for boat, m in measured.items():
+        m = m.loc[np.isfinite(m["progress_m"])].sort_index()
+        if m.empty:
+            continue
+        obs = m.index.to_numpy("datetime64[ns]").astype("int64")
+        query = grid.to_numpy("datetime64[ns]").astype("int64")
+        right = np.searchsorted(obs, query, side="left")
+        hi = np.clip(right, 0, len(obs) - 1)
+        lo = np.clip(right - 1, 0, len(obs) - 1)
+        exact = obs[hi] == query
+        valid = exact | ((right > 0) & (right < len(obs)) & ((obs[hi] - obs[lo]) <= max_gap_s * 1e9))
+        values = np.interp(query - obs[0], obs - obs[0], m["progress_m"])
+        label_index = np.where(exact, hi, lo)
+        labels = m["leg"].to_numpy(float)[label_index]
+        values[~valid], labels[~valid] = np.nan, np.nan
+        finish, status = finishes[boat]
+        if pd.notna(finish):
+            if status == "estimated":
+                approaching = (grid > m.index[-1]) & (grid < finish)
+                fraction = (grid[approaching] - m.index[-1]).total_seconds() / (finish - m.index[-1]).total_seconds()
+                values[approaching] = m["progress_m"].iloc[-1] + fraction * (total - m["progress_m"].iloc[-1])
+                labels[approaching] = course.n_legs
+            completed = grid >= finish
+            values[completed], labels[completed] = total, course.n_legs + 1
+        prog[boat], legs[boat] = values, labels
+    progress, leg = pd.DataFrame(prog, index=grid), pd.DataFrame(legs, index=grid)
     started = progress.where(leg >= 1)
-    dtl = (-started).add(started.max(axis=1), axis=0)
+    dtl = started.rsub(started.max(axis=1), axis=0)
+    dtl.attrs["finish_status"] = {b: status for b, (_, status) in finishes.items()}
     return dtl, progress, leg
 
 
