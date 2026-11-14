@@ -8,7 +8,7 @@ import pytest
 
 from sgp import geo, race, wind
 from sgp.course import Course, Waypoint, add_course_metrics, distance_to_leader
-from sgp.polar import Polar, min_manoeuvres
+from sgp.polar import Polar, course_min_manoeuvres, line_min_manoeuvres, min_manoeuvres
 
 
 @pytest.fixture
@@ -170,6 +170,28 @@ def test_default_grid_edges_cannot_bridge_thin_notches(polar):
 def test_margin_applies_to_fetch_endpoints(polar):
     poly = np.array([[-10., -10], [1010., -10], [1010., 10], [-10., 10]])
     assert min_manoeuvres([0, 0], [1000, 0], 0, 30, polar, boundary=poly, margin=20)["path"] is None
+
+
+def test_finish_line_is_a_segment_target_not_two_marks(polar):
+    # One end of the line needs a tack, the other sits inside the boundary margin; in between is a fetch.
+    box = np.array([[-200., -200], [1005., -200], [1005., 1200], [-200., 1200]])
+    a, b = np.array([300., 1000]), np.array([1000., 300])
+    assert min_manoeuvres([0, 0], a, 0, 30, polar, boundary=box, margin=20)["manoeuvres"] == 1
+    assert min_manoeuvres([0, 0], b, 0, 30, polar, boundary=box, margin=20)["manoeuvres"] is None
+    result = line_min_manoeuvres([0, 0], a, b, 0, 30, polar, boundary=box, margin=20)
+    assert result["manoeuvres"] == 0
+    assert np.allclose(geo.closest_point_on_segment(result["target"][None, :], a, b)[0], result["target"])
+    assert min(np.linalg.norm(result["target"] - a), np.linalg.norm(result["target"] - b)) >= 20
+
+
+def test_course_table_targets_the_finish_line_once(course, polar):
+    # Finish mark "f" is 10 m from the boundary: as a point target it is infeasible at a 20 m margin.
+    bounded = replace(course, limits={"Boundary": np.array([[-700., -100], [110., -100], [110., 1100], [-700., 1100]])})
+    table = course_min_manoeuvres(bounded, 0, 30, polar, margin=20)
+    last = table[table["leg"] == bounded.n_legs]
+    assert last["to"].unique().tolist() == ["fi line"]
+    assert last["manoeuvres"].min() == 1
+    assert set(table[table["leg"] == 1]["to"]) == {"c", "d"}
 
 
 def test_usa_invalid_height_channel_is_removed(course):

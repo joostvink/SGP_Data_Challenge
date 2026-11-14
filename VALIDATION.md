@@ -7,7 +7,8 @@ gun-straddling crossings, finite start lines, terminal endpoints and directed ma
 gate-progress continuity, whole-gap masking and retained completed boats; leg intervals that
 telescope to elapsed race time; observed, estimated and incomplete finishes; equal-time
 distance/speed cancellation; distinct valid reference boats; invalid ride-height exclusion;
-nonconvex boundary edges, fetches, endpoint margins and time-aware trailing tack votes.
+nonconvex boundary edges, fetches, endpoint margins, finish-line targets and time-aware trailing
+tack votes.
 
 The notebook asserts that start and leg contributions reconcile with the same inferred finishes
 in all four races. This validates internal consistency, not official results. Logged leg counters
@@ -31,7 +32,8 @@ Tack differences can reflect spatial/time sampling as well as calibration. The p
 is relative to the fleet; same-day held-out improvement does not establish absolute correctness.
 Controlled reciprocal runs and different days/course orientations are needed.
 
-Race tacks are the principal model population; pre-start tacks are a sensitivity population.
+Race tacks are the principal model population; pre-start tacks are a sensitivity population,
+and the pre-start flag is a feature only in that pooled model.
 Full models contain during-event features and are retrospective. Entry-only validation tests
 information available before the turn. Outer evaluation and inner alpha selection group by boat.
 Whole-team bootstrap intervals are pointwise and conditional on selected regularisation; ten
@@ -41,7 +43,8 @@ team clusters limit precision. Correlated coefficients are associations, not con
 
 Routing minimises switches on a finite grid of two best-VMG headings. Full edges must satisfy
 the margin, but initial tack, legal mark clearance and heading continuity across independently
-evaluated legs are not modelled. A grid optimum is not a continuous global optimum. Tactical
+evaluated legs are not modelled. Gate marks are separate point targets; the finish is a line,
+sampled at points at least the margin inside its ends. A grid optimum is not a continuous global optimum. Tactical
 use requires grid, wind, sailing-angle and rounding sensitivity checks.
 
 Phase shares use gross positive losses when gains are clipped; this differs from net finish

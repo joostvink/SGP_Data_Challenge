@@ -129,19 +129,51 @@ def min_manoeuvres(start, target, twd, tws, polar: Polar, boundary=None, margin=
     return {"mode": mode, "manoeuvres": best, "twa": angle, "path": np.array(corners[::-1])}
 
 
+def line_min_manoeuvres(start, a, b, twd, tws, polar: Polar, boundary=None, margin=0.0, n=120, samples=21) -> dict:
+    """Fewest manoeuvres to any sampled point of the line a-b.
+
+    A finish line is crossed, not rounded, so every point of it is a valid
+    target. ``samples`` evenly spaced points are tried, kept ``margin`` metres
+    inside both ends; the route with the fewest manoeuvres wins and ties go to
+    the shortest one. The result of ``min_manoeuvres`` is returned with the
+    chosen ``target`` added (the line midpoint when no sampled point is
+    feasible).
+    """
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    length = float(np.linalg.norm(b - a))
+    inset = min(margin, length / 2) / length if length > 0 else 0.5
+    best, best_key = None, None
+    for f in np.linspace(inset, 1.0 - inset, samples):
+        target = a + f * (b - a)
+        res = min_manoeuvres(start, target, twd, tws, polar, boundary, margin, n)
+        if res["manoeuvres"] is None:
+            continue
+        key = (res["manoeuvres"], float(np.linalg.norm(np.diff(res["path"], axis=0), axis=1).sum()))
+        if best_key is None or key < best_key:
+            best, best_key = {**res, "target": target}, key
+    if best is None:
+        middle = (a + b) / 2
+        best = {**min_manoeuvres(start, middle, twd, tws, polar, boundary, margin, n), "target": middle}
+    return best
+
+
 def course_min_manoeuvres(course: Course, twd, tws, polar: Polar, margin=0.0, n=120) -> pd.DataFrame:
     """Minimum manoeuvres for every leg, from every mark of the previous waypoint to every mark of the next.
 
     For a gate each of its marks is a separate target (and a separate start
     for the following leg), because the cheaper side of a gate is exactly
-    what a tactician wants to know.
+    what a tactician wants to know. The finish line is one target: any point
+    of it at least ``margin`` metres inside its ends (``line_min_manoeuvres``).
     """
     rows = []
     for leg in range(1, course.n_legs + 1):
         prev, nxt = course.waypoints[leg - 1], course.waypoints[leg]
         starts = [("mid " + prev.name[:2], prev.centre)] if leg == 1 else list(zip(prev.mark_names, prev.xy))
         for s_name, s_xy in starts:
-            for t_name, t_xy in zip(nxt.mark_names, nxt.xy):
-                res = min_manoeuvres(s_xy, t_xy, twd, tws, polar, course.boundary, margin, n)
+            if leg == course.n_legs and nxt.is_gate:
+                results = [(nxt.name[:2] + " line", line_min_manoeuvres(s_xy, nxt.xy[0], nxt.xy[1], twd, tws, polar, course.boundary, margin, n))]
+            else:
+                results = [(t_name, min_manoeuvres(s_xy, t_xy, twd, tws, polar, course.boundary, margin, n)) for t_name, t_xy in zip(nxt.mark_names, nxt.xy)]
+            for t_name, res in results:
                 rows.append({"leg": leg, "from": s_name, "to": t_name, "mode": res["mode"], "manoeuvres": res["manoeuvres"], "path": res["path"]})
     return pd.DataFrame(rows)
